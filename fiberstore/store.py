@@ -19,9 +19,9 @@ from .codec import (BIN_COLS, INDEX_SUFFIX, LEN_COLS, MAX_READ_LEN, META_KEY, PO
                     ROW_GROUP, SCHEMA, dec_len, dec_pos)
 
 
-def read_meta(path):
-    """The fiberstore metadata dict of a store file."""
-    md = pq.read_schema(path).metadata or {}
+def read_meta(path, schema=None):
+    """The fiberstore metadata dict of a store file (or of an already-read schema)."""
+    md = (schema or pq.read_schema(path)).metadata or {}
     if META_KEY not in md:
         raise ValueError(f"{path}: not a fiberstore file (no {META_KEY.decode()} metadata)")
     return json.loads(md[META_KEY])
@@ -35,7 +35,7 @@ class FiberStore:
     def __init__(self, path, index=True):
         self.path = path
         self._pf = pq.ParquetFile(path)
-        self.meta = read_meta(path)
+        self.meta = read_meta(path, self._pf.schema_arrow)   # footer parsed once
         # chrom -> (first row group, n row groups, n rows)
         self._rg = {c: tuple(v) for c, v in self.meta["chrom_rows"].items()}
         for c, (rg0, nrg, n) in self._rg.items():
