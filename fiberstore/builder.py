@@ -1,15 +1,18 @@
-"""BAM -> fiberstore directory.  The only module that imports pysam."""
+"""BAM -> fiberstore file.  The only module that imports pysam."""
 import glob
 import json
 import os
+import shutil
 import time
+import uuid
 import multiprocessing as mp
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .codec import ROW_GROUP, SCHEMA, enc_ints, enc_pos
+from .codec import (FORMAT, INDEX_SUFFIX, META_KEY, PART_SCHEMA, ROW_GROUP, SCHEMA, STATS_COLS,
+                    enc_ints, enc_pos)
 from .lift import flip_intervals, lift_intervals, query_to_ref
 
 __version_note__ = "uint8 escape-255 deltas"
@@ -69,8 +72,8 @@ def fiber_row(r, rg_index, movie_index):
 
 
 def _write_rows(writer, rows):
-    cols = {k: [row[k] for row in rows] for k in SCHEMA.names}
-    writer.write_table(pa.table(cols, schema=SCHEMA))
+    cols = {k: [row[k] for row in rows] for k in PART_SCHEMA.names}
+    writer.write_table(pa.table(cols, schema=PART_SCHEMA))
 
 
 def build_chunk(args):
@@ -79,7 +82,7 @@ def build_chunk(args):
     bam_path, chrom, s, e, out, rg_index, movies = args
     movie_index = {m: i for i, m in enumerate(movies)}
     bam = pysam.AlignmentFile(bam_path, "rb")
-    writer = pq.ParquetWriter(out, SCHEMA, compression="zstd", compression_level=9)
+    writer = pq.ParquetWriter(out, PART_SCHEMA, compression="zstd", compression_level=3)
     rows, n = [], 0
     for r in bam.fetch(chrom, s, e):
         if r.is_supplementary or r.is_secondary or r.is_unmapped:
@@ -99,37 +102,41 @@ def build_chunk(args):
     return chrom, s, n, len(movie_index) > len(movies)
 
 
-def merge_chrom(args):
-    """Stream a chromosome's parts (genomic order) into one file with row groups of
-    exactly ROW_GROUP rows (except the last)."""
-    outdir, c = args
-    parts = sorted(glob.glob(os.path.join(outdir, "parts", f"{c}.*.parquet")))
-    if not parts:
-        return c, 0
-    w = pq.ParquetWriter(os.path.join(outdir, f"{c}.parquet"), SCHEMA,
-                         compression="zstd", compression_level=9)
-    buf = None
-    for p in parts:
-        t = pq.read_table(p)
-        buf = t if buf is None else pa.concat_tables([buf, t])
-        n_full = (buf.num_rows // ROW_GROUP) * ROW_GROUP
-        if n_full:
-            w.write_table(buf.slice(0, n_full), row_group_size=ROW_GROUP)
-            buf = buf.slice(n_full)
-    if buf is not None and buf.num_rows:
-        w.write_table(buf, row_group_size=ROW_GROUP)
+def assemble(out, names, parts_dir, meta, log):
+    """Stream the parts (genomic order) into one file: row groups of exactly ROW_GROUP
+    rows, restarted at every chromosome boundary, with the chrom column added."""
+    parts = {c: sorted(glob.glob(os.path.join(parts_dir, f"{c}.*.parquet"))) for c in names}
+    chrom_rows, rg, row = {}, 0, 0
+    for c in names:
+        n = sum(pq.read_metadata(p).num_rows for p in parts[c])
+        nrg = -(-n // ROW_GROUP)
+        chrom_rows[c] = [rg, nrg, n]
+        rg, row = rg + nrg, row + n
+    meta = dict(meta, chrom_rows=chrom_rows, n_fibers=row)
+    schema = SCHEMA.with_metadata({META_KEY: json.dumps(meta).encode()})
+    w = pq.ParquetWriter(out, schema, compression="zstd", compression_level=9,
+                         write_statistics=STATS_COLS)
+    for c in names:
+        buf = None
+        for p in parts[c]:
+            t = pq.read_table(p)
+            t = t.add_column(0, "chrom", pa.array([c] * t.num_rows, pa.string()))
+            buf = t if buf is None else pa.concat_tables([buf, t])
+            n_full = (buf.num_rows // ROW_GROUP) * ROW_GROUP
+            if n_full:
+                w.write_table(buf.slice(0, n_full), row_group_size=ROW_GROUP)
+                buf = buf.slice(n_full)
+        if buf is not None and buf.num_rows:
+            w.write_table(buf, row_group_size=ROW_GROUP)
+        log(f"assembled {c}: {chrom_rows[c][2]} fibers from {len(parts[c])} parts")
     w.close()
-    for p in parts:
-        os.remove(p)
-    return c, len(parts)
+    return row
 
 
-def build(bam_path, outdir, workers=20, chunk=1_000_000, chroms=None, log=print):
-    """Build a fiberstore at `outdir` from an indexed, coordinate-sorted BAM.
-
-    Keeps primary alignments only.  `chunk` is the genomic span per worker task.
-    Returns the number of fibers written.
-    """
+def build(bam_path, out, workers=20, chunk=1_000_000, chroms=None, log=print):
+    """Build the fiberstore file `out` (and its `.fsi` index) from an indexed,
+    coordinate-sorted BAM.  Keeps primary alignments only; `chunk` is the genomic
+    span per worker task.  Returns the number of fibers written."""
     import pysam
     from .store import FiberStore
     log = log or (lambda *a, **k: None)
@@ -142,13 +149,14 @@ def build(bam_path, outdir, workers=20, chunk=1_000_000, chroms=None, log=print)
         if rg.get("PU") and rg["PU"] not in movies:
             movies.append(rg["PU"])
     names = list(chroms) if chroms else list(bam.references)
-    os.makedirs(os.path.join(outdir, "parts"), exist_ok=True)
+    parts_dir = out + ".parts"
+    os.makedirs(parts_dir, exist_ok=True)
     tasks = []
     for c in names:
         L = bam.get_reference_length(c)
         for s in range(0, L, chunk):
             tasks.append((bam_path, c, s, min(s + chunk, L),
-                          os.path.join(outdir, "parts", f"{c}.{s:012d}.parquet"), rg_index, movies))
+                          os.path.join(parts_dir, f"{c}.{s:012d}.parquet"), rg_index, movies))
     bam.close()
     log(f"{len(tasks)} chunks over {len(names)} chromosomes, {workers} workers")
     t0 = time.time()
@@ -163,14 +171,14 @@ def build(bam_path, outdir, workers=20, chunk=1_000_000, chroms=None, log=print)
             log(f"[{done}/{len(tasks)} {time.time()-t0:7.0f}s] {c}:{s} {n} fibers")
     if unseen_movie:
         log("WARNING: a qname movie was not among the @RG PU fields; movie index unreliable")
-    with ctx.Pool(min(workers, 6)) as pool:
-        for c, k in pool.imap_unordered(merge_chrom, [(outdir, c) for c in names]):
-            log(f"merged {c}: {k} parts")
-    os.rmdir(os.path.join(outdir, "parts"))
-    with open(os.path.join(outdir, "meta.json"), "w") as f:
-        json.dump({"source_bam": os.path.abspath(bam_path), "read_groups": rgs, "movies": movies,
-                   "row_group": ROW_GROUP, "chroms": names, "encoding": __version_note__,
-                   "built": time.strftime("%Y-%m-%d %H:%M")}, f, indent=1)
-    FiberStore(outdir)  # writes index.npz
+    meta = {"format": FORMAT, "build_id": uuid.uuid4().hex, "source_bam": os.path.abspath(bam_path),
+            "read_groups": rgs, "movies": movies, "row_group": ROW_GROUP, "chroms": names,
+            "encoding": __version_note__, "built": time.strftime("%Y-%m-%d %H:%M")}
+    n = assemble(out, names, parts_dir, meta, log)
+    assert n == total, (n, total)
+    shutil.rmtree(parts_dir)
+    if os.path.exists(out + INDEX_SUFFIX):
+        os.remove(out + INDEX_SUFFIX)
+    FiberStore(out)  # writes the sidecar index
     log(f"done: {total} fibers in {time.time()-t0:.0f}s")
     return total

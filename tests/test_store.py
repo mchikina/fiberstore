@@ -1,6 +1,12 @@
+import os
+import shutil
+
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
+from fiberstore import FiberStore, read_meta
 from fiberstore.cli import main
 from fiberstore.codec import ROW_GROUP
 from fiberstore.validation import validate
@@ -39,14 +45,58 @@ def test_every_field_matches_truth(store):
                 assert got == tr[kind], (k, kind)
 
 
-def test_row_groups_uniform(store):
+def test_file_layout(store):
+    """One Parquet file: rows in (chrom, start) order, uniform row groups that never
+    straddle a chromosome, metadata row-group table consistent with the file."""
     fs, _ = store
+    md = pq.read_metadata(fs.path)
+    assert md.num_row_groups == sum(v[1] for v in fs._rg.values())
+    assert md.num_rows == len(fs)
+    for c, (rg0, nrg, n) in fs._rg.items():
+        sizes = [md.row_group(rg0 + i).num_rows for i in range(nrg)]
+        assert sizes[:-1] == [ROW_GROUP] * (nrg - 1) and 0 < sizes[-1] <= ROW_GROUP
+        assert sum(sizes) == n == len(fs.start[c])
+        if n > ROW_GROUP:
+            assert nrg >= 2
+    # readable as a plain table by anything that speaks Parquet
+    t = pq.read_table(fs.path, columns=["chrom", "start"])
+    chrom = np.array(t["chrom"].to_pylist())
+    for c, (rg0, nrg, n) in fs._rg.items():
+        rows = np.nonzero(chrom == c)[0]
+        assert len(rows) == n and (n == 0 or rows[-1] - rows[0] + 1 == n)
+        assert np.array_equal(t["start"].to_numpy()[rows], fs.start[c])
+    assert read_meta(fs.path)["n_fibers"] == len(fs)
+    assert md.row_group(0).column(md.schema.names.index("m6a")).statistics is None
+
+
+def test_sidecar_index(store, tmp_path):
+    fs, _ = store
+    idx = fs.index_path
+    assert os.path.exists(idx)
+    # missing sidecar: rebuilt from the file, identical, and written back
+    os.remove(idx)
+    fs2 = FiberStore(fs.path)
+    assert os.path.exists(idx)
     for c in fs.chroms:
-        pf, offsets = fs._file(c)
-        sizes = np.diff(offsets)
-        if len(fs.start[c]) > ROW_GROUP:
-            assert pf.metadata.num_row_groups >= 2
-        assert np.all(sizes[:-1] == ROW_GROUP) and 0 < sizes[-1] <= ROW_GROUP
+        assert np.array_equal(fs2.start[c], fs.start[c]) and np.array_equal(fs2.end[c], fs.end[c])
+    # sidecar from another build: ignored and replaced
+    with open(idx, "wb") as f:
+        np.savez(f, build_id=np.array("stale"), **{f"{c}_s": fs.start[c][:1] for c in fs.chroms},
+                 **{f"{c}_e": fs.end[c][:1] for c in fs.chroms})
+    fs3 = FiberStore(fs.path)
+    assert len(fs3.start[fs.chroms[0]]) == len(fs.start[fs.chroms[0]])
+    assert str(np.load(idx)["build_id"]) == fs.meta["build_id"]
+    # a store copied elsewhere without its sidecar still opens
+    shutil.copy(fs.path, tmp_path / "copy.parquet")
+    fs4 = FiberStore(str(tmp_path / "copy.parquet"))
+    assert len(fs4) == len(fs) and os.path.exists(str(tmp_path / "copy.parquet.fsi"))
+
+
+def test_not_a_store(tmp_path):
+    p = tmp_path / "plain.parquet"
+    pq.write_table(pa.table({"a": [1, 2]}), p)
+    with pytest.raises(ValueError, match="not a fiberstore"):
+        FiberStore(str(p))
 
 
 def test_select_matches_bruteforce(store):

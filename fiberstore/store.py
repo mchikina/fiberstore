@@ -1,45 +1,94 @@
-"""Read side: in-memory interval index + row-group-granular Parquet fetch.  No pysam."""
+"""Read side: one Parquet file + sidecar interval index.  No pysam.
+
+Layout invariants (written by builder.build, relied on here):
+  * rows sorted by (chrom, start) in the chromosome order of the metadata;
+  * row groups of exactly ROW_GROUP rows, never straddling a chromosome, so the
+    last group of each chromosome is the only partial one;
+  * the JSON under schema-metadata key META_KEY records, per chromosome, its first
+    row group, number of row groups and number of rows.
+"""
 import json
 import os
+import warnings
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .codec import BIN_COLS, LEN_COLS, MAX_READ_LEN, POS_COLS, SCHEMA, dec_len, dec_pos
+from .codec import (BIN_COLS, INDEX_SUFFIX, LEN_COLS, MAX_READ_LEN, META_KEY, POS_COLS,
+                    ROW_GROUP, SCHEMA, dec_len, dec_pos)
+
+
+def read_meta(path):
+    """The fiberstore metadata dict of a store file."""
+    md = pq.read_schema(path).metadata or {}
+    if META_KEY not in md:
+        raise ValueError(f"{path}: not a fiberstore file (no {META_KEY.decode()} metadata)")
+    return json.loads(md[META_KEY])
 
 
 class FiberStore:
-    """A fiberstore directory.  Opening loads (or builds) `index.npz`: per-chromosome
-    uint32 start/end arrays, ~8 bytes per fiber in memory."""
+    """A fiberstore file.  Opening loads the sidecar index `<path>.fsi` (per-chromosome
+    uint32 start/end arrays, 8 bytes per fiber in memory) or rebuilds it from the
+    start/end columns when it is missing or belongs to a different build."""
 
-    def __init__(self, path):
+    def __init__(self, path, index=True):
         self.path = path
-        with open(os.path.join(path, "meta.json")) as f:
-            self.meta = json.load(f)
-        self.files = {c: os.path.join(path, f"{c}.parquet") for c in self.meta["chroms"]
-                      if os.path.exists(os.path.join(path, f"{c}.parquet"))}
-        self._pf = {}
-        idx = os.path.join(path, "index.npz")
-        if os.path.exists(idx):
-            z = np.load(idx)
-            self.start = {c: z[f"{c}_s"] for c in self.files}
-            self.end = {c: z[f"{c}_e"] for c in self.files}
-        else:
-            self.start, self.end = {}, {}
-            for c, f in self.files.items():
-                t = pq.read_table(f, columns=["start", "end"])
-                self.start[c] = t["start"].to_numpy().astype(np.uint32)
-                self.end[c] = t["end"].to_numpy().astype(np.uint32)
-            np.savez(idx, **{f"{c}_s": v for c, v in self.start.items()},
-                     **{f"{c}_e": v for c, v in self.end.items()})
+        self._pf = pq.ParquetFile(path)
+        self.meta = read_meta(path)
+        # chrom -> (first row group, n row groups, n rows)
+        self._rg = {c: tuple(v) for c, v in self.meta["chrom_rows"].items()}
+        for c, (rg0, nrg, n) in self._rg.items():
+            if nrg != -(-n // ROW_GROUP):
+                raise ValueError(f"{path}: {c} has {nrg} row groups for {n} rows")
+        self.start, self.end = {}, {}
+        if index:
+            self._load_index()
 
+    # ------------------------------------------------------------------ index
+    @property
+    def index_path(self):
+        return self.path + INDEX_SUFFIX
+
+    def _load_index(self):
+        p = self.index_path
+        if os.path.exists(p):
+            try:
+                with np.load(p) as z:
+                    if str(z["build_id"]) == self.meta["build_id"]:
+                        self.start = {c: z[f"{c}_s"] for c in self._rg}
+                        self.end = {c: z[f"{c}_e"] for c in self._rg}
+                        return
+            except (KeyError, OSError, ValueError):
+                pass
+        self.build_index()
+
+    def build_index(self, write=True):
+        """Rebuild the in-memory index from the start/end columns (a scan of two uint32
+        columns over the whole file) and, if `write`, save it as the sidecar."""
+        t = self._pf.read(columns=["start", "end"])
+        st = t["start"].to_numpy().astype(np.uint32)
+        en = t["end"].to_numpy().astype(np.uint32)
+        row = 0
+        for c, (rg0, nrg, n) in self._rg.items():
+            self.start[c], self.end[c] = st[row:row + n], en[row:row + n]
+            row += n
+        if write:
+            try:
+                with open(self.index_path, "wb") as f:   # file object: no ".npz" appended
+                    np.savez(f, build_id=np.array(self.meta["build_id"]),
+                             **{f"{c}_s": v for c, v in self.start.items()},
+                             **{f"{c}_e": v for c, v in self.end.items()})
+            except OSError as e:
+                warnings.warn(f"could not write {self.index_path}: {e}")
+
+    # ------------------------------------------------------------------ basics
     def __len__(self):
-        return sum(len(v) for v in self.start.values())
+        return sum(v[2] for v in self._rg.values())
 
     @property
     def chroms(self):
-        return list(self.files)
+        return list(self._rg)
 
     @property
     def columns(self):
@@ -51,8 +100,8 @@ class FiberStore:
 
     # ------------------------------------------------------------------ selection
     def select(self, chrom, s, e, min_frac=0.0, min_overlap=1):
-        """Row indices (into chrom's table, ascending) of fibers overlapping [s, e) by
-        at least max(min_overlap, min_frac * (e - s)) bases.  Pure numpy on the index."""
+        """Row indices (within chrom, ascending) of fibers overlapping [s, e) by at
+        least max(min_overlap, min_frac * (e - s)) bases.  Pure numpy on the index."""
         st, en = self.start[chrom], self.end[chrom]
         i0 = np.searchsorted(st, max(0, s - MAX_READ_LEN), "left")
         i1 = np.searchsorted(st, e, "left")
@@ -66,15 +115,6 @@ class FiberStore:
                          for s, e in zip(starts, ends)], np.int64)
 
     # ------------------------------------------------------------------ fetching
-    def _file(self, chrom):
-        """ParquetFile plus the cumulative row offset of each row group."""
-        if chrom not in self._pf:
-            pf = pq.ParquetFile(self.files[chrom])
-            md = pf.metadata
-            sizes = np.array([md.row_group(i).num_rows for i in range(md.num_row_groups)], np.int64)
-            self._pf[chrom] = (pf, np.concatenate([[0], np.cumsum(sizes)]))
-        return self._pf[chrom]
-
     def fetch(self, chrom, rows, columns=None, decode=True):
         """Fetch rows (indices from `select`) as {column: array-or-list}.
 
@@ -90,12 +130,15 @@ class FiberStore:
             return {c: ([] if c in BIN_COLS else
                         pa.array([], SCHEMA.field(c).type).to_numpy(zero_copy_only=False))
                     for c in cols}
-        pf, offsets = self._file(chrom)
-        grp = np.searchsorted(offsets, rows, "right") - 1        # row group of each row
+        rg0, nrg, n = self._rg[chrom]
+        if rows.min() < 0 or rows.max() >= n:
+            raise IndexError(f"row out of range for {chrom} ({n} rows)")
+        grp = rows // ROW_GROUP                      # row group of each row, within chrom
         groups = np.unique(grp)
-        tab = pf.read_row_groups(groups.tolist(), columns=read_cols)
-        local = np.concatenate([[0], np.cumsum(offsets[groups + 1] - offsets[groups])])
-        base = local[np.searchsorted(groups, grp)] + (rows - offsets[grp])
+        tab = self._pf.read_row_groups((rg0 + groups).tolist(), columns=read_cols)
+        # groups come back in ascending order and only the chromosome's last group can
+        # be partial, so every group but the last of `groups` spans exactly ROW_GROUP rows
+        base = np.searchsorted(groups, grp) * ROW_GROUP + rows % ROW_GROUP
         tab = tab.take(pa.array(base))
         out = {}
         starts = tab["start"].to_numpy() if need_start else None

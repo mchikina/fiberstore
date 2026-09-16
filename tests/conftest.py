@@ -18,7 +18,7 @@ def bam(tmp_path_factory):
 @pytest.fixture(scope="session")
 def store(bam, tmp_path_factory):
     path, truth, _ = bam
-    out = tmp_path_factory.mktemp("store") / "fs"
+    out = tmp_path_factory.mktemp("store") / "fs.parquet"
     # small chunks so every chromosome has several parts, most with a partial row group
     build(str(path), str(out), workers=2, chunk=5_000, log=None)
     return FiberStore(str(out)), truth

@@ -1,9 +1,10 @@
 """fiberstore command line.
 
-    fiberstore build    BAM STORE [--workers 20] [--chunk 1000000] [--chroms chr1,chr2]
-    fiberstore validate BAM STORE [--n 300]
-    fiberstore query    STORE chr1:100000000-100001000 [--min_frac 0.88]
-    fiberstore info     STORE
+    fiberstore build    BAM STORE.parquet [--workers 20] [--chunk 1000000] [--chroms chr1,chr2]
+    fiberstore index    STORE.parquet            rebuild the .fsi sidecar
+    fiberstore validate BAM STORE.parquet [--n 300]
+    fiberstore query    STORE.parquet chr1:100000000-100001000 [--min_frac 0.88]
+    fiberstore info     STORE.parquet
 """
 import argparse
 import sys
@@ -20,12 +21,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="fiberstore", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    b = sub.add_parser("build", help="BAM -> store directory")
+    b = sub.add_parser("build", help="BAM -> store file (+ .fsi index)")
     b.add_argument("bam")
     b.add_argument("store")
     b.add_argument("--workers", type=int, default=20)
     b.add_argument("--chunk", type=int, default=1_000_000, help="genomic span per worker task")
     b.add_argument("--chroms", default=None, help="comma-separated subset")
+    x = sub.add_parser("index", help="rebuild the sidecar index")
+    x.add_argument("store")
     v = sub.add_parser("validate", help="compare random regions against the BAM")
     v.add_argument("bam")
     v.add_argument("store")
@@ -43,6 +46,9 @@ def main(argv=None):
     if a.cmd == "build":
         from .builder import build
         build(a.bam, a.store, a.workers, a.chunk, a.chroms.split(",") if a.chroms else None)
+    elif a.cmd == "index":
+        from .store import FiberStore
+        FiberStore(a.store, index=False).build_index()
     elif a.cmd == "validate":
         from .validation import validate
         sys.exit(0 if validate(a.bam, a.store, a.n, a.seed) else 1)
